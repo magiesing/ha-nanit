@@ -143,9 +143,31 @@ class NanitRestClient:
                 uid=baby["uid"],
                 name=baby["name"],
                 camera_uid=baby["camera_uid"],
+                speaker_uid=baby.get("speaker", {}).get("speaker", {}).get("uid"),
             )
             for baby in body.get("babies", [])
         ]
+
+    async def async_get_device_token(
+        self,
+        access_token: str,
+        speaker_uid: str,
+    ) -> str:
+        """Get a local device token for a Sound & Light speaker."""
+        try:
+            resp = await self._session.post(
+                f"{self._base_url}/speakers/{speaker_uid}/udtokens",
+                headers={**NANIT_API_HEADERS, "Authorization": access_token},
+            )
+        except aiohttp.ClientError as err:
+            raise NanitConnectionError(str(err)) from err
+
+        if resp.status == 401:
+            raise NanitAuthError("Access token invalid")
+
+        resp.raise_for_status()
+        body = await resp.json()
+        return body["token"]
 
     async def async_get_events(
         self,

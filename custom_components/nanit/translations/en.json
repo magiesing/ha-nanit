@@ -55,10 +55,11 @@
         }
       },
       "camera_ip": {
-        "title": "Camera IP for {camera_name}",
-        "description": "Enter the local IP address for **{camera_name}** for local-first connectivity. Leave blank to use cloud only.",
+        "title": "Device IPs for {camera_name}",
+        "description": "Enter local IP addresses for **{camera_name}** for local-first connectivity. Leave blank to use cloud only.",
         "data": {
-          "camera_ip": "Camera IP Address"
+          "camera_ip": "Camera IP Address",
+          "speaker_ip": "Sound & Light Machine IP Address"
         }
       }
     }
@@ -84,19 +85,31 @@
     "sensor": {
       "temperature": { "name": "Temperature" },
       "humidity": { "name": "Humidity" },
-      "light": { "name": "Light Level" }
+      "light": { "name": "Light Level" },
+      "sl_temperature": { "name": "Temperature" },
+      "sl_humidity": { "name": "Humidity" }
     },
     "binary_sensor": {
       "motion": { "name": "Motion" },
       "sound": { "name": "Sound" },
-      "connectivity": { "name": "Connectivity" }
+      "connectivity": { "name": "Connectivity" },
+      "sl_connectivity": { "name": "Connectivity" }
     },
     "switch": {
       "night_light": { "name": "Night Light" },
-      "camera_power": { "name": "Camera Power" }
+      "camera_power": { "name": "Camera Power" },
+      "sound_machine_switch": { "name": "Power" },
+      "sl_sound_switch": { "name": "Sound" }
     },
     "number": {
-      "volume": { "name": "Volume" }
+      "volume": { "name": "Volume" },
+      "sound_machine_volume": { "name": "Volume" }
+    },
+    "light": {
+      "sound_light_light": { "name": "Light" }
+    },
+    "select": {
+      "sound_machine_sound": { "name": "Sound Track" }
     },
     "camera": {
       "camera": { "name": "Camera" }

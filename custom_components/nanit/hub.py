@@ -25,8 +25,10 @@ from aionanit import (
 from aionanit.exceptions import NanitCameraUnavailable
 from aionanit.models import Baby
 
-from .const import CONF_CAMERA_IPS, CONF_REFRESH_TOKEN, DOMAIN
-from .coordinator import NanitCloudCoordinator, NanitPushCoordinator
+from .const import CONF_CAMERA_IPS, CONF_REFRESH_TOKEN, CONF_SPEAKER_IPS, DOMAIN
+from .coordinator import NanitCloudCoordinator, NanitPushCoordinator, NanitSoundLightCoordinator
+
+from .aionanit_sl.sound_light import NanitSoundLight
 
 if TYPE_CHECKING:
     from . import NanitConfigEntry
@@ -42,6 +44,7 @@ class CameraData:
     baby: Baby
     push_coordinator: NanitPushCoordinator
     cloud_coordinator: NanitCloudCoordinator | None
+    sound_light_coordinator: NanitSoundLightCoordinator | None = None
 
 
 class NanitHub:
@@ -63,6 +66,7 @@ class NanitHub:
         self._client = NanitClient(session)
         self._camera_data: dict[str, CameraData] = {}
         self._babies: list[Baby] = []
+        self._sound_lights: dict[str, NanitSoundLight] = {}
         self._unsubscribe_tokens: Callable[[], None] | None = None
 
     @property
@@ -109,12 +113,13 @@ class NanitHub:
 
         # Per-camera IP configuration from options
         camera_ips: dict[str, str] = self._entry.options.get(CONF_CAMERA_IPS, {})
+        speaker_ips: dict[str, str] = self._entry.options.get(CONF_SPEAKER_IPS, {})
 
         # Create camera + coordinators for each baby
         failed_cameras: list[str] = []
         for baby in babies:
             try:
-                await self._setup_camera(baby, camera_ips.get(baby.camera_uid))
+                await self._setup_camera(baby, camera_ips.get(baby.camera_uid), speaker_ips.get(baby.camera_uid))
             except NanitAuthError:
                 # Auth errors are account-level — propagate immediately
                 raise
@@ -155,6 +160,7 @@ class NanitHub:
         self,
         baby: Baby,
         camera_ip: str | None,
+        speaker_ip: str | None,
     ) -> None:
         """Create a camera instance and its coordinators for a single baby."""
         camera = self._client.camera(
@@ -180,6 +186,36 @@ class NanitHub:
             )
             cloud_coordinator = None
 
+        # Sound & Light Machine coordinator (optional — local WebSocket push)
+        sound_light_coordinator: NanitSoundLightCoordinator | None = None
+        speaker_uid = baby.speaker_uid
+
+        if speaker_uid and speaker_ip:
+            try:
+                sound_light = self.get_sound_light(speaker_uid, speaker_ip)
+                sound_light_coordinator = NanitSoundLightCoordinator(
+                    self._hass, self._entry, sound_light
+                )
+                sound_light_coordinator.baby = baby
+                await sound_light_coordinator.async_setup()
+            except NanitAuthError:
+                raise
+            except Exception:
+                _LOGGER.info(
+                    "Sound & Light Machine coordinator for %s failed to start; "
+                    "sound/light entities disabled",
+                    baby.name,
+                )
+                sound_light_coordinator = None
+        else:
+            _LOGGER.debug(
+                "No speaker UID/IP for %s; Sound & Light Machine entities skipped "
+                "(speaker_uid=%s, speaker_ip=%s)",
+                baby.name,
+                speaker_uid,
+                speaker_ip,
+            )
+
         ir.async_delete_issue(self._hass, DOMAIN, f"camera_connection_failed_{baby.camera_uid}")
 
         self._camera_data[baby.camera_uid] = CameraData(
@@ -187,6 +223,7 @@ class NanitHub:
             baby=baby,
             push_coordinator=push_coordinator,
             cloud_coordinator=cloud_coordinator,
+            sound_light_coordinator=sound_light_coordinator,
         )
 
     @callback
@@ -201,6 +238,28 @@ class NanitHub:
             },
         )
 
+    def get_sound_light(
+        self,
+        speaker_uid: str,
+        device_ip: str,
+    ) -> NanitSoundLight:
+        """Get or create a NanitSoundLight instance."""
+        if speaker_uid in self._sound_lights:
+            return self._sound_lights[speaker_uid]
+
+        if self._client.token_manager is None:
+            raise NanitAuthError("Not authenticated — call async_login first")
+
+        sl = NanitSoundLight(
+            speaker_uid=speaker_uid,
+            device_ip=device_ip,
+            token_manager=self._client.token_manager,
+            rest_client=self._client.rest_client,
+            session=self._client.session,
+        )
+        self._sound_lights[speaker_uid] = sl
+        return sl
+
     async def async_close(self) -> None:
         """Stop all cameras and clean up."""
         if self._unsubscribe_tokens is not None:
@@ -208,3 +267,10 @@ class NanitHub:
             self._unsubscribe_tokens = None
         await self._client.async_close()
         self._camera_data.clear()
+        # Also stop S&L instances
+        for sl in list(self._sound_lights.values()):
+            try:
+                await sl.async_stop()
+            except Exception:
+                _LOGGER.debug("Error stopping S&L during close")
+        self._sound_lights.clear()

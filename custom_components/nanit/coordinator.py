@@ -10,6 +10,9 @@ NanitPushCoordinator: Push-based coordinator that wraps NanitCamera.subscribe().
 
 NanitCloudCoordinator: Polls the Nanit cloud API for motion/sound events every
     CLOUD_POLL_INTERVAL seconds.
+
+NanitSoundLightCoordinator: Push-based coordinator wrapping NanitSoundLight.subscribe().
+    Receives state updates from the S&L device's local WebSocket.
 """
 
 from __future__ import annotations
@@ -26,6 +29,9 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from aionanit import NanitAuthError, NanitCamera, NanitConnectionError
 from aionanit.models import Baby, CameraEvent, CameraState, CloudEvent
+
+from .aionanit_sl.models import SoundLightEvent, SoundLightEventKind, SoundLightFullState
+from .aionanit_sl.sound_light import NanitSoundLight
 
 from .const import CLOUD_POLL_INTERVAL, DOMAIN
 
@@ -193,3 +199,60 @@ class NanitCloudCoordinator(DataUpdateCoordinator[list[CloudEvent]]):
                 translation_key="cloud_fetch_failed",
                 translation_placeholders={"error": str(err)},
             ) from err
+
+
+class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
+    """Push-based coordinator for the Nanit Sound & Light Machine.
+
+    Wraps NanitSoundLight.subscribe() — receives state updates from
+    the S&L device's local WebSocket (raw protobuf over wss://{ip}:442).
+    No polling — all state is pushed by the device.
+    """
+
+    config_entry: NanitConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: NanitConfigEntry,
+        sound_light: NanitSoundLight,
+    ) -> None:
+        """Initialize the Sound & Light coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=f"{DOMAIN}_{sound_light.speaker_uid}_sound_light",
+        )
+        self.sound_light = sound_light
+        self.baby: Baby = None  # type: ignore[assignment]  # Set by hub._setup_camera before use
+        self._unsubscribe: Callable[[], None] | None = None
+
+    @property
+    def connected(self) -> bool:
+        """Derive connection state from the underlying S&L device."""
+        return self.sound_light.connected
+
+    async def async_setup(self) -> None:
+        """Start the S&L device and subscribe to push events."""
+        self._unsubscribe = self.sound_light.subscribe(self._on_sl_event)
+        await self.sound_light.async_start()
+        self.async_set_updated_data(self.sound_light.state)
+
+    @callback
+    def _on_sl_event(self, event: SoundLightEvent) -> None:
+        """Handle a push event from NanitSoundLight.subscribe()."""
+        if event.kind == SoundLightEventKind.CONNECTION_CHANGE and not self.connected:
+            _LOGGER.debug(
+                "S&L %s disconnected",
+                self.sound_light.speaker_uid,
+            )
+        self.async_set_updated_data(event.state)
+
+    async def async_shutdown(self) -> None:
+        """Stop the S&L device and unsubscribe."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        await self.sound_light.async_stop()
+        await super().async_shutdown()
