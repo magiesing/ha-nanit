@@ -30,11 +30,13 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Nanit Sound & Light Machine light entity."""
-    coordinator = entry.runtime_data.sound_light_coordinator
-    if coordinator is None:
-        return
+    entities: list[LightEntity] = []
+    for cam_data in entry.runtime_data.cameras.values():
+        sl_coordinator = cam_data.sound_light_coordinator
+        if sl_coordinator is not None:
+            entities.append(NanitSoundLightLight(sl_coordinator, entry))
 
-    async_add_entities([NanitSoundLightLight(coordinator, entry)])
+    async_add_entities(entities)
 
 
 class NanitSoundLightLight(NanitSoundLightEntity, LightEntity):
