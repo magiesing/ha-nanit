@@ -17,7 +17,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .aionanit_sl.exceptions import NanitTransportError
 
 from . import NanitConfigEntry
-from .const import CONF_CAMERA_UID
 from .coordinator import NanitSoundLightCoordinator
 from .entity import NanitSoundLightEntity
 
@@ -34,7 +33,7 @@ async def async_setup_entry(
     for cam_data in entry.runtime_data.cameras.values():
         sl_coordinator = cam_data.sound_light_coordinator
         if sl_coordinator is not None:
-            entities.append(NanitSoundLightLight(sl_coordinator, entry))
+            entities.append(NanitSoundLightLight(sl_coordinator))
 
     async_add_entities(entities)
 
@@ -49,15 +48,11 @@ class NanitSoundLightLight(NanitSoundLightEntity, LightEntity):
     def __init__(
         self,
         coordinator: NanitSoundLightCoordinator,
-        entry: NanitConfigEntry,
     ) -> None:
         """Initialize."""
         super().__init__(coordinator)
-        self._entry = entry
-        self._attr_unique_id = (
-            f"{entry.data.get(CONF_CAMERA_UID, entry.entry_id)}"
-            "_sound_light_light"
-        )
+        baby = coordinator.baby
+        self._attr_unique_id = f"{baby.camera_uid}_sound_light_light"
 
     @property
     def is_on(self) -> bool | None:

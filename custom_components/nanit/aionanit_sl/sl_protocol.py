@@ -583,20 +583,6 @@ def build_sl_keepalive() -> bytes:
     return _encode_length_delimited(1, inner)
 
 
-def build_state_request() -> bytes:
-    """Build a state request probe to prompt the device to send its full state.
-
-    Sends: 1 { 6 { } }  — an empty state body inside the command wrapper.
-
-    On a local WebSocket the device sends full state on connect, but the
-    cloud relay does not forward that initial dump. Sending this probe
-    after a cloud relay connect (and periodically thereafter) triggers the
-    device to echo back its current state.
-    """
-    field_6 = _encode_length_delimited(6, b"")
-    return _encode_length_delimited(1, field_6)
-
-
 def build_power_cmd(on: bool) -> bytes:
     """Build command to turn device power on/off.
 

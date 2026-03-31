@@ -30,7 +30,6 @@ from .sl_protocol import (
     build_power_cmd,
     build_sl_keepalive,
     build_sound_on_cmd,
-    build_state_request,
     build_track_cmd,
     build_volume_cmd,
     classify_message,
@@ -75,8 +74,8 @@ class NanitSoundLight:
     #   Falls back to cloud relay if local connection fails.
     # - When no IP is configured: use cloud relay
     #   (wss://remote.nanit.com/speakers/{uid}/user_connect/) with Bearer token.
-    #   Cloud relay doesn't send initial state or temp/humidity, so we send
-    #   a state request probe after connecting.
+    #   Cloud relay doesn't send initial state on connect, so we restore
+    #   the last known state from HA Store on startup.
 
     def __init__(
         self,
@@ -125,6 +124,15 @@ class NanitSoundLight:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def connection_mode(self) -> str:
+        """Return the current connection mode: 'local', 'cloud', or 'unavailable'."""
+        if not self._connected:
+            return "unavailable"
+        if self._use_cloud_relay:
+            return "cloud"
+        return "local"
 
     # ------------------------------------------------------------------
     # Subscription
@@ -297,26 +305,26 @@ class NanitSoundLight:
                 "user-agent": "NanitLite/1.8.0 (com.udisense.nanitlite; build:168; homeassistant)",
                 "x-nanit-service": "1.8.0 (168)",
             }
-            resp = await self._session.get(
+            async with self._session.get(
                 f"{self._rest._base_url}/speakers/{self._speaker_uid}/udtokens",
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
-            )
-            if resp.status == 401:
-                from aionanit import NanitAuthError
-                raise NanitAuthError("Access token invalid for udtokens")
-            if resp.status != 200:
-                body = await resp.text()
-                raise NanitConnectionError(
-                    f"HTTP {resp.status} fetching udtokens for {self._speaker_uid}: {body[:200]}"
-                )
-            body = await resp.json(content_type=None)
-            token = body.get("user_device_token", {}).get("token")
-            if not token:
-                raise NanitConnectionError(
-                    f"No token in udtokens response for speaker {self._speaker_uid}"
-                )
-            self._device_token = token
+            ) as resp:
+                if resp.status == 401:
+                    from aionanit import NanitAuthError
+                    raise NanitAuthError("Access token invalid for udtokens")
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise NanitConnectionError(
+                        f"HTTP {resp.status} fetching udtokens for {self._speaker_uid}: {body[:200]}"
+                    )
+                body = await resp.json(content_type=None)
+                token = body.get("user_device_token", {}).get("token")
+                if not token:
+                    raise NanitConnectionError(
+                        f"No token in udtokens response for speaker {self._speaker_uid}"
+                    )
+                self._device_token = token
 
         _LOGGER.debug(
             "Fetched device token for speaker %s (len=%d)",
@@ -461,17 +469,6 @@ class NanitSoundLight:
             self._poll_task = loop.create_task(self._poll_loop())
 
             self._fire_event(SoundLightEventKind.CONNECTION_CHANGE)
-
-            # Cloud relay doesn't send a state dump on connect (local WS does).
-            # Send a state request probe — the device may respond with current
-            # state. The coordinator also restores last known state from disk
-            # so entities aren't "unknown" while waiting for the first update.
-            if self._use_cloud_relay and self._ws is not None:
-                try:
-                    await self._async_send(build_state_request())
-                    _LOGGER.debug("S&L sent state request probe after cloud relay connect")
-                except NanitTransportError:
-                    _LOGGER.debug("S&L state request probe failed (non-fatal)")
 
             _LOGGER.info(
                 "S&L device %s connected via %s",
@@ -656,38 +653,22 @@ class NanitSoundLight:
             return
 
     async def _poll_loop(self) -> None:
-        """Periodically request fresh state from the device.
+        """Periodically reconnect to refresh state from the device.
 
-        For local WebSocket: the device sends a full state dump on each
-        connect, so we reconnect to refresh.
-
-        For cloud relay: reconnecting does NOT trigger a state dump.
-        Instead we send a state request probe on the existing connection.
+        The local WebSocket sends a full state dump on each connect.
+        For cloud relay, state is pushed on changes and restored from
+        disk on startup — reconnecting keeps the connection healthy.
         """
         try:
             while not self._stopped:
                 await asyncio.sleep(_POLL_INTERVAL)
                 if self._stopped:
                     return
-
-                if self._use_cloud_relay and self._ws is not None and not self._ws.closed:
-                    # Cloud relay: send state request probe on existing connection
-                    _LOGGER.debug("S&L poll: sending state request probe")
-                    try:
-                        await self._async_send(build_state_request())
-                    except NanitTransportError:
-                        _LOGGER.debug("S&L poll probe failed, triggering reconnect")
-                        try:
-                            await self._async_connect(silent=True)
-                        except Exception as err:  # noqa: BLE001
-                            _LOGGER.debug("S&L poll reconnect failed: %s", err)
-                else:
-                    # Local WebSocket: reconnect to get fresh state dump
-                    _LOGGER.debug("S&L poll: reconnecting to refresh state")
-                    try:
-                        await self._async_connect(silent=True)
-                    except Exception as err:  # noqa: BLE001
-                        _LOGGER.debug("S&L poll reconnect failed: %s", err)
+                _LOGGER.debug("S&L poll: reconnecting to refresh state")
+                try:
+                    await self._async_connect(silent=True)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("S&L poll reconnect failed: %s", err)
         except asyncio.CancelledError:
             return
 
