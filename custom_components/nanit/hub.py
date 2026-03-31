@@ -111,19 +111,32 @@ class NanitHub:
             _LOGGER.warning("No babies/cameras found on Nanit account")
             return
 
-        # Discover speaker UIDs from the raw /babies API response.
-        # The installed aionanit package may not have speaker_uid on the Baby
-        # dataclass yet, so we fetch it ourselves as a fallback.
-        speaker_uid_map: dict[str, str] = {}
-        for baby in babies:
-            uid = getattr(baby, "speaker_uid", None)
-            if uid:
-                speaker_uid_map[baby.camera_uid] = uid
+        # Discover speaker UIDs — try persisted data first, then aionanit,
+        # then raw /babies API as final fallback.
+        speaker_uid_map: dict[str, str] = dict(
+            self._entry.data.get("speaker_uid_map", {})
+        )
+        if not speaker_uid_map:
+            for baby in babies:
+                uid = getattr(baby, "speaker_uid", None)
+                if uid:
+                    speaker_uid_map[baby.camera_uid] = uid
         if not speaker_uid_map:
             try:
                 speaker_uid_map = await self._discover_speaker_uids()
             except Exception:
                 _LOGGER.debug("Speaker UID discovery from raw API failed", exc_info=True)
+
+        # Persist discovered speaker UIDs so they survive restarts
+        stored_map = self._entry.data.get("speaker_uid_map", {})
+        if speaker_uid_map and speaker_uid_map != stored_map:
+            self._hass.config_entries.async_update_entry(
+                self._entry,
+                data={**self._entry.data, "speaker_uid_map": speaker_uid_map},
+            )
+            _LOGGER.info(
+                "Persisted speaker UID map: %s", speaker_uid_map
+            )
 
         # Per-camera IP configuration from options
         camera_ips: dict[str, str] = self._entry.options.get(CONF_CAMERA_IPS, {})
@@ -316,7 +329,9 @@ class NanitHub:
         result: dict[str, str] = {}
         for baby in body.get("babies", []):
             camera_uid = baby.get("camera_uid")
-            speaker_uid = baby.get("speaker", {}).get("speaker", {}).get("uid")
+            speaker_data = baby.get("speaker", {})
+            speaker_obj = speaker_data.get("speaker", {})
+            speaker_uid = speaker_obj.get("uid")
             if camera_uid and speaker_uid:
                 result[camera_uid] = speaker_uid
                 _LOGGER.debug(

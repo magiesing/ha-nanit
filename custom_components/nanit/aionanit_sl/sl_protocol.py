@@ -326,6 +326,20 @@ def is_cloud_relay_forbidden(data: bytes) -> bool:
         return False
 
 
+def is_cloud_relay_ack(data: bytes) -> bool:
+    """Check if a message is a cloud relay command acknowledgment.
+
+    Cloud relay sends back field 3 { field 1 { field 1: 1 } } after
+    receiving a command. These are safe to ignore.
+    """
+    try:
+        outer = decode_fields(data)
+        f3 = get_field(outer, 3)
+        return f3 is not None and f3.wire_type == LENGTH_DELIMITED
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Sensor decoding — Message type 1
 # ---------------------------------------------------------------------------
@@ -481,6 +495,7 @@ def classify_message(data: bytes) -> int | None:
         1 = sensor data (has field 1.10)
         2 = routine set A (type field = 2)
         3 = routine set B (type field = 3)
+        -1 = network info / ignorable (field 1 with large varint type indicator)
         None = unknown
     """
     try:
@@ -497,6 +512,10 @@ def classify_message(data: bytes) -> int | None:
             val = f1_inner.value
             if val in (2, 3):
                 return val
+            # Large varint values (e.g. timestamps) indicate network info
+            # or other device metadata messages — safe to ignore.
+            if val > 3:
+                return -1
 
         # Check for sensor data (field 10)
         f10 = get_field(inner, 10)

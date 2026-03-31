@@ -38,6 +38,7 @@ from .sl_protocol import (
     decode_full_state,
     decode_routines,
     decode_sensors,
+    is_cloud_relay_ack,
     is_cloud_relay_forbidden,
 )
 
@@ -271,10 +272,14 @@ class NanitSoundLight:
     # ------------------------------------------------------------------
 
     async def _async_fetch_device_token(self) -> None:
-        """Fetch the RS256 device token from /speakers/{uid}/udtokens.
+        """Fetch the RS256 device token via GET /speakers/{uid}/udtokens.
+
+        The NanitLite app uses specific headers for this endpoint.
+        Returns a short-lived RS256 JWT used to authenticate the local
+        WebSocket connection (wss://{ip}:442/).
 
         Uses the rest client's method if available, otherwise makes the
-        API call directly (for compatibility with aionanit < 1.1).
+        API call directly (the installed aionanit package may not have it).
         """
         access_token = await self._token_manager.async_get_access_token()
 
@@ -283,17 +288,35 @@ class NanitSoundLight:
                 access_token, self._speaker_uid
             )
         else:
-            # Inline fallback for aionanit versions without this method
-            resp = await self._session.post(
+            # Inline implementation matching the NanitLite app's exact request
+            headers = {
+                "accept": "application/json",
+                "authorization": f"token {access_token}",
+                "accept-charset": "UTF-8",
+                "x-nanit-platform": "homeassistant",
+                "user-agent": "NanitLite/1.8.0 (com.udisense.nanitlite; build:168; homeassistant)",
+                "x-nanit-service": "1.8.0 (168)",
+            }
+            resp = await self._session.get(
                 f"{self._rest._base_url}/speakers/{self._speaker_uid}/udtokens",
-                headers={"Authorization": access_token},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
             )
             if resp.status == 401:
                 from aionanit import NanitAuthError
-                raise NanitAuthError("Access token invalid for device token request")
-            resp.raise_for_status()
-            body = await resp.json()
-            self._device_token = body["token"]
+                raise NanitAuthError("Access token invalid for udtokens")
+            if resp.status != 200:
+                body = await resp.text()
+                raise NanitConnectionError(
+                    f"HTTP {resp.status} fetching udtokens for {self._speaker_uid}: {body[:200]}"
+                )
+            body = await resp.json(content_type=None)
+            token = body.get("user_device_token", {}).get("token")
+            if not token:
+                raise NanitConnectionError(
+                    f"No token in udtokens response for speaker {self._speaker_uid}"
+                )
+            self._device_token = token
 
         _LOGGER.debug(
             "Fetched device token for speaker %s (len=%d)",
@@ -440,8 +463,9 @@ class NanitSoundLight:
             self._fire_event(SoundLightEventKind.CONNECTION_CHANGE)
 
             # Cloud relay doesn't send a state dump on connect (local WS does).
-            # Send a state request probe to prompt the device to respond with
-            # its current state. This populates entities immediately on startup.
+            # Send a state request probe — the device may respond with current
+            # state. The coordinator also restores last known state from disk
+            # so entities aren't "unknown" while waiting for the first update.
             if self._use_cloud_relay and self._ws is not None:
                 try:
                     await self._async_send(build_state_request())
@@ -558,6 +582,10 @@ class NanitSoundLight:
         if is_cloud_relay_forbidden(data):
             return
 
+        # Silently ignore cloud relay command acknowledgments (field 3 envelope)
+        if is_cloud_relay_ack(data):
+            return
+
         # Try local protocol decoding
         msg_type = classify_message(data)
 
@@ -596,6 +624,10 @@ class NanitSoundLight:
                     routines=tuple(existing.values()),
                 )
                 self._fire_event(SoundLightEventKind.ROUTINES_UPDATE)
+
+        elif msg_type == -1:
+            # Network info / device metadata — safe to ignore
+            pass
 
         else:
             _LOGGER.debug(
@@ -639,7 +671,7 @@ class NanitSoundLight:
                     return
 
                 if self._use_cloud_relay and self._ws is not None and not self._ws.closed:
-                    # Cloud relay: send probe on existing connection
+                    # Cloud relay: send state request probe on existing connection
                     _LOGGER.debug("S&L poll: sending state request probe")
                     try:
                         await self._async_send(build_state_request())

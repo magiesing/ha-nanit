@@ -22,9 +22,12 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+import dataclasses
+
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from aionanit import NanitAuthError, NanitCamera, NanitConnectionError
@@ -201,12 +204,25 @@ class NanitCloudCoordinator(DataUpdateCoordinator[list[CloudEvent]]):
             ) from err
 
 
+_SL_STORE_VERSION = 1
+# Fields from SoundLightFullState that we persist across restarts.
+_SL_PERSIST_FIELDS = (
+    "brightness", "light_enabled", "color_r", "color_g",
+    "sound_on", "current_track", "volume",
+    "power_on", "temperature_c", "humidity_pct",
+)
+
+
 class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
     """Push-based coordinator for the Nanit Sound & Light Machine.
 
     Wraps NanitSoundLight.subscribe() — receives state updates from
-    the S&L device's local WebSocket (raw protobuf over wss://{ip}:442).
+    the S&L device via WebSocket (cloud relay or local).
     No polling — all state is pushed by the device.
+
+    Persists the last known state to HA storage so that entities show
+    their previous values on restart (instead of "unknown") until the
+    first live update arrives from the device.
     """
 
     config_entry: NanitConfigEntry
@@ -227,6 +243,11 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
         self.sound_light = sound_light
         self.baby: Baby = None  # type: ignore[assignment]  # Set by hub._setup_camera before use
         self._unsubscribe: Callable[[], None] | None = None
+        self._store: Store = Store(
+            hass,
+            _SL_STORE_VERSION,
+            f"{DOMAIN}_sl_state_{sound_light.speaker_uid}",
+        )
 
     @property
     def connected(self) -> bool:
@@ -237,7 +258,62 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
         """Start the S&L device and subscribe to push events."""
         self._unsubscribe = self.sound_light.subscribe(self._on_sl_event)
         await self.sound_light.async_start()
-        self.async_set_updated_data(self.sound_light.state)
+
+        # If the device hasn't sent initial state yet (cloud relay),
+        # restore the last known state from disk so entities aren't "unknown".
+        state = self.sound_light.state
+        if state.power_on is None:
+            restored = await self._async_restore_state()
+            if restored is not None:
+                # Feed restored state into the sound_light instance so
+                # entities and coordinator data are consistent.
+                self.sound_light._state = restored
+                state = restored
+                _LOGGER.debug(
+                    "S&L %s: restored saved state (power=%s, track=%s, vol=%s)",
+                    self.sound_light.speaker_uid,
+                    restored.power_on,
+                    restored.current_track,
+                    restored.volume,
+                )
+
+        self.async_set_updated_data(state)
+
+    async def _async_restore_state(self) -> SoundLightFullState | None:
+        """Load persisted S&L state from HA storage."""
+        try:
+            data = await self._store.async_load()
+            if not data or not isinstance(data, dict):
+                return None
+            kwargs = {}
+            for field in _SL_PERSIST_FIELDS:
+                if field in data and data[field] is not None:
+                    kwargs[field] = data[field]
+            if not kwargs:
+                return None
+            # Convert available_tracks if present
+            if "available_tracks" in data and data["available_tracks"]:
+                kwargs["available_tracks"] = tuple(data["available_tracks"])
+            return SoundLightFullState(**kwargs)
+        except Exception:
+            _LOGGER.debug("Failed to restore S&L state", exc_info=True)
+            return None
+
+    async def _async_save_state(self, state: SoundLightFullState) -> None:
+        """Persist current S&L state to HA storage."""
+        try:
+            data = {}
+            for field in _SL_PERSIST_FIELDS:
+                val = getattr(state, field, None)
+                if val is not None:
+                    data[field] = val
+            # Also save available_tracks
+            if state.available_tracks:
+                data["available_tracks"] = list(state.available_tracks)
+            if data:
+                await self._store.async_save(data)
+        except Exception:
+            _LOGGER.debug("Failed to save S&L state", exc_info=True)
 
     @callback
     def _on_sl_event(self, event: SoundLightEvent) -> None:
@@ -249,10 +325,19 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
             )
         self.async_set_updated_data(event.state)
 
+        # Save state to disk on every meaningful update so it survives restarts
+        if event.kind in (
+            SoundLightEventKind.STATE_UPDATE,
+            SoundLightEventKind.SENSOR_UPDATE,
+        ):
+            self.hass.async_create_task(self._async_save_state(event.state))
+
     async def async_shutdown(self) -> None:
         """Stop the S&L device and unsubscribe."""
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
+        # Save final state before stopping
+        await self._async_save_state(self.sound_light.state)
         await self.sound_light.async_stop()
         await super().async_shutdown()
