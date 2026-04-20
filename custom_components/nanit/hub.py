@@ -287,7 +287,7 @@ class NanitHub:
             speaker_uid=speaker_uid,
             token_manager=self._client.token_manager,
             rest_client=self._client.rest_client,
-            session=getattr(self._client, "session", self._client._session),
+            session=self._client.session,
             device_ip=device_ip,
         )
         self._sound_lights[speaker_uid] = sl
@@ -319,8 +319,8 @@ class NanitHub:
             return {}
         access_token = await tm.async_get_access_token()
         rest = self._client.rest_client
-        resp = await rest._session.get(
-            f"{rest._base_url}/babies",
+        resp = await rest.session.get(
+            f"{rest.base_url}/babies",
             headers={"Authorization": access_token},
         )
         resp.raise_for_status()

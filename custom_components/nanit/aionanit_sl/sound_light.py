@@ -7,7 +7,6 @@ import dataclasses
 import logging
 import ssl
 from collections.abc import Callable
-from typing import Any
 
 import aiohttp
 
@@ -102,9 +101,10 @@ class NanitSoundLight:
         # WebSocket state
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._recv_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._token_refresh_task: asyncio.Task[None] | None = None
-        self._ssl_ctx: ssl.SSLContext | None = None
+        self._local_ssl_ctx: ssl.SSLContext | None = None
         self._connect_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -122,6 +122,10 @@ class NanitSoundLight:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    def restore_state(self, state: SoundLightFullState) -> None:
+        """Restore persisted state (used by coordinator on startup)."""
+        self._state = state
 
     @property
     def connection_mode(self) -> str:
@@ -185,14 +189,16 @@ class NanitSoundLight:
                 "S&L %s initial connection failed; will retry in background",
                 self._speaker_uid,
             )
-            asyncio.get_running_loop().create_task(self._reconnect_loop())
+            self._reconnect_task = asyncio.get_running_loop().create_task(
+                self._reconnect_loop()
+            )
 
     async def async_stop(self) -> None:
         """Stop the S&L connection gracefully."""
         self._stopped = True
         await self._async_close_ws()
 
-        for task_attr in ("_poll_task", "_token_refresh_task"):
+        for task_attr in ("_reconnect_task", "_poll_task", "_token_refresh_task"):
             task = getattr(self, task_attr, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -300,11 +306,11 @@ class NanitSoundLight:
         """
         access_token = await self._token_manager.async_get_access_token()
 
-        if hasattr(self._rest, "async_get_device_token"):
+        try:
             self._device_token = await self._rest.async_get_device_token(
                 access_token, self._speaker_uid
             )
-        else:
+        except AttributeError:
             # Inline implementation matching the NanitLite app's exact request
             headers = {
                 "accept": "application/json",
@@ -315,7 +321,7 @@ class NanitSoundLight:
                 "x-nanit-service": "1.8.0 (168)",
             }
             async with self._session.get(
-                f"{self._rest._base_url}/speakers/{self._speaker_uid}/udtokens",
+                f"{self._rest.base_url}/speakers/{self._speaker_uid}/udtokens",
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
@@ -375,10 +381,12 @@ class NanitSoundLight:
         async with self._connect_lock:
             await self._async_close_ws()
 
-            if self._ssl_ctx is None:
-                self._ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                self._ssl_ctx.check_hostname = False
-                self._ssl_ctx.verify_mode = ssl.CERT_NONE
+            # Local connections use self-signed certs → CERT_NONE.
+            # Cloud relay (remote.nanit.com) uses default TLS verification (ssl=None).
+            if self._local_ssl_ctx is None:
+                self._local_ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                self._local_ssl_ctx.check_hostname = False
+                self._local_ssl_ctx.verify_mode = ssl.CERT_NONE
 
             if not silent:
                 self._connected = False
@@ -413,7 +421,7 @@ class NanitSoundLight:
                             headers=headers,
                             heartbeat=_HEARTBEAT_INTERVAL,
                             timeout=_HANDSHAKE_TIMEOUT,
-                            ssl=self._ssl_ctx,
+                            ssl=self._local_ssl_ctx,
                         )
                     except Exception as err:
                         _LOGGER.debug(
@@ -440,7 +448,7 @@ class NanitSoundLight:
                         headers=headers,
                         heartbeat=_HEARTBEAT_INTERVAL,
                         timeout=_HANDSHAKE_TIMEOUT,
-                        ssl=self._ssl_ctx,
+                        # Cloud relay uses default TLS verification (no ssl= override)
                     )
                     # Track that we ended up on cloud relay (affects poll strategy)
                     self._use_cloud_relay = True
@@ -485,14 +493,16 @@ class NanitSoundLight:
             )
 
     async def _async_close_ws(self) -> None:
-        """Close WebSocket and cancel recv task."""
-        if self._recv_task is not None and not self._recv_task.done():
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
-        self._recv_task = None
+        """Close WebSocket and cancel recv/reconnect tasks."""
+        for task_attr in ("_recv_task", "_reconnect_task"):
+            task = getattr(self, task_attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            setattr(self, task_attr, None)
 
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
@@ -537,9 +547,11 @@ class NanitSoundLight:
         self._connected = False
         self._fire_event(SoundLightEventKind.CONNECTION_CHANGE)
         if not self._stopped:
-            asyncio.get_running_loop().create_task(self._reconnect_loop())
+            self._reconnect_task = asyncio.get_running_loop().create_task(
+                self._reconnect_loop()
+            )
 
-    def _apply_state(self, decoded: Any) -> None:
+    def _apply_state(self, decoded: SLDecodedState) -> None:
         """Merge a decoded state into the current state and fire event."""
         self._state = dataclasses.replace(
             self._state,

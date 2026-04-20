@@ -254,6 +254,8 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
         )
         self._sl_connected: bool = False
         self._availability_timer: CALLBACK_TYPE | None = None
+        self._save_timer: CALLBACK_TYPE | None = None
+        self._pending_save_state: SoundLightFullState | None = None
 
     @property
     def connected(self) -> bool:
@@ -274,7 +276,7 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
             if restored is not None:
                 # Feed restored state into the sound_light instance so
                 # entities and coordinator data are consistent.
-                self.sound_light._state = restored
+                self.sound_light.restore_state(restored)
                 state = restored
                 _LOGGER.debug(
                     "S&L %s: restored saved state (power=%s, track=%s, vol=%s)",
@@ -351,12 +353,33 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
 
         self.async_set_updated_data(event.state)
 
-        # Save state to disk on every meaningful update so it survives restarts
+        # Debounce state saves — at most every 5 seconds to avoid
+        # overlapping writes from rapid state/sensor updates.
         if event.kind in (
             SoundLightEventKind.STATE_UPDATE,
             SoundLightEventKind.SENSOR_UPDATE,
         ):
-            self.hass.async_create_task(self._async_save_state(event.state))
+            self._schedule_save(event.state)
+
+    @callback
+    def _schedule_save(self, state: SoundLightFullState) -> None:
+        """Schedule a debounced state save (at most every 5 seconds)."""
+        self._pending_save_state = state
+        if self._save_timer is not None:
+            # Timer already running — it will pick up the latest state
+            return
+        self._save_timer = async_call_later(
+            self.hass, 5, self._do_save
+        )
+
+    @callback
+    def _do_save(self, _now: object) -> None:
+        """Execute the debounced state save."""
+        self._save_timer = None
+        if self._pending_save_state is not None:
+            state = self._pending_save_state
+            self._pending_save_state = None
+            self.hass.async_create_task(self._async_save_state(state))
 
     @callback
     def _on_availability_timeout(self, _now: object) -> None:
@@ -387,6 +410,11 @@ class NanitSoundLightCoordinator(DataUpdateCoordinator[SoundLightFullState]):
     async def async_shutdown(self) -> None:
         """Stop the S&L device and unsubscribe."""
         self._cancel_availability_timer()
+        # Cancel debounced save timer and flush final state
+        if self._save_timer is not None:
+            self._save_timer()
+            self._save_timer = None
+        self._pending_save_state = None
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
